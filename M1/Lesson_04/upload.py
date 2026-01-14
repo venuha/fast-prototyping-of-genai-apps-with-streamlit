@@ -1,126 +1,143 @@
-# import packages
 import streamlit as st
-import pandas as pd
-import os
-import plotly.express as px
 import openai
 from dotenv import load_dotenv
+import PyPDF2
 
-
-# Load environment variables
 load_dotenv()
-
-# Initialize OpenAI client
 client = openai.OpenAI()
 
+st.set_page_config(page_title="PDF Summarizer", layout="wide")
+st.title("📄 GenAI PDF Summarizer")
 
-# Helper function to get dataset path
-def get_dataset_path():
-    # Get the current script directory
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    # Construct the path to the CSV file
-    csv_path = os.path.join(current_dir, "..", "..", "..", "data", "customer_reviews.csv")
-    return csv_path
+st.write("Upload a PDF from your computer, extract its text, and summarize it using GenAI.")
 
+# ----------------------------
+# Helpers
+# ----------------------------
+def extract_text_from_pdf(uploaded_file) -> str:
+    """
+    Extract text from a text-based PDF using PyPDF2.
+    Note: If the PDF is scanned images, this will return little/no text.
+    """
+    reader = PyPDF2.PdfReader(uploaded_file)
+    text_parts = []
+    for page in reader.pages:
+        text_parts.append(page.extract_text() or "")
+    return "\n".join(text_parts).strip()
 
-# Function to get sentiment using GenAI
-@st.cache_data
-def get_sentiment(text):
-    if not text or pd.isna(text):
-        return "Neutral"
+def chunk_text(text: str, chunk_size: int = 8000):
+    """Simple chunking to handle long documents."""
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+def summarize_with_openai(text: str, style: str = "Bullets") -> str:
+    system_msg = (
+        "You are a careful assistant that summarizes documents. "
+        "Be accurate and do not invent details. If content is unclear, say so."
+    )
+
+    style_map = {
+        "Short (5-7 lines)": "Summarize in 5-7 lines.",
+        "Bullets": "Summarize in bullet points with key themes.",
+        "Detailed": "Provide a detailed summary with headings and key points.",
+        "Action Items": "List action items, decisions, risks, and open questions if any."
+    }
+
+    user_msg = (
+        f"{style_map.get(style, 'Summarize clearly.')}\n\n"
+        f"DOCUMENT:\n{text}"
+    )
+
+    resp = client.responses.create(
+        model="gpt-4o",
+        input=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.2,
+        max_output_tokens=800,
+    )
+    return resp.output[0].content[0].text.strip()
+
+def summarize_large_pdf(full_text: str, style: str) -> str:
+    """
+    Two-pass approach:
+    1) summarize each chunk
+    2) summarize all chunk summaries into final output
+    """
+    chunks = chunk_text(full_text, chunk_size=8000)
+    chunk_summaries = []
+
+    for i, ch in enumerate(chunks, start=1):
+        with st.spinner(f"Summarizing chunk {i}/{len(chunks)}..."):
+            chunk_summaries.append(summarize_with_openai(ch, style="Bullets"))
+
+    combined = "\n\n".join([f"Chunk {i} summary:\n{s}" for i, s in enumerate(chunk_summaries, start=1)])
+
+    with st.spinner("Creating final summary..."):
+        final = summarize_with_openai(combined, style=style)
+
+    return final
+
+# ----------------------------
+# UI
+# ----------------------------
+uploaded_pdf = st.file_uploader("Upload a PDF", type=["pdf"])
+
+style = st.selectbox(
+    "Summary style",
+    ["Short (5-7 lines)", "Bullets", "Detailed", "Action Items"]
+)
+
+col1, col2 = st.columns([1, 1])
+summarize_btn = col1.button("🧠 Summarize PDF", type="primary")
+clear_btn = col2.button("🧹 Clear")
+
+if clear_btn:
+    st.session_state.pop("pdf_text", None)
+    st.session_state.pop("summary", None)
+    st.success("Cleared!")
+
+if uploaded_pdf is not None:
     try:
-        response = client.responses.create(
-            model="gpt-4o",  # Use the latest chat model
-            input=[
-                {"role": "system", "content": "Classify the sentiment of the following review as exactly one word: Positive, Negative, or Neutral."},
-                {"role": "user", "content": f"What's the sentiment of this review? {text}"}
-            ],
-            temperature=0,  # Deterministic output
-            max_output_tokens=100  # Limit response length
-        )
-        return response.output[0].content[0].text.strip()
-    except Exception as e:
-        st.error(f"API error: {e}")
-        return "Neutral"
+        pdf_text = extract_text_from_pdf(uploaded_pdf)
 
-
-
-
-st.title("🔍 GenAI Sentiment Analysis Dashboard")
-st.write("This is your GenAI-powered data processing app.")
-
-# Layout two buttons side by side
-col1, col2 = st.columns(2)
-
-with col1:
-    if st.button("📥 Load Dataset"):
-        try:
-            csv_path = get_dataset_path()
-            df = pd.read_csv(csv_path)
-            st.session_state["df"] = df.head(10)
-            st.success("Dataset loaded successfully!")
-        except FileNotFoundError:
-            st.error("Dataset not found. Please check the file path.")
-
-with col2:
-    if st.button("🔍 Analyze Sentiment"):
-        if "df" in st.session_state:
-            try:
-                with st.spinner("Analyzing sentiment..."):
-                    st.session_state["df"].loc[:, "Sentiment"] = st.session_state["df"]["SUMMARY"].apply(get_sentiment)
-                    st.success("Sentiment analysis completed!")
-            except Exception as e:
-                st.error(f"Something went wrong: {e}")
+        if not pdf_text:
+            st.warning(
+                "No text could be extracted. This PDF might be scanned images. "
+                "If you want, I can give you OCR-based code next."
+            )
         else:
-            st.warning("Please ingest the dataset first.")
+            st.session_state["pdf_text"] = pdf_text
 
-# Display the dataset if it exists
-if "df" in st.session_state:
-    # Product filter dropdown
-    st.subheader("🔍 Filter by Product")
-    product = st.selectbox("Choose a product", ["All Products"] + list(st.session_state["df"]["PRODUCT"].unique()))
-    st.subheader(f"📁 Reviews for {product}")
+            with st.expander("🔎 Preview extracted text"):
+                st.text_area("Extracted text (preview)", pdf_text[:12000], height=250)
 
-    if product != "All Products":
-        filtered_df = st.session_state["df"][st.session_state["df"]["PRODUCT"] == product]
+            st.info(f"Extracted characters: {len(pdf_text):,}")
+
+    except Exception as e:
+        st.error(f"Failed to read PDF: {e}")
+
+if summarize_btn:
+    if "pdf_text" not in st.session_state or not st.session_state["pdf_text"].strip():
+        st.warning("Upload a PDF with extractable text first.")
     else:
-        filtered_df = st.session_state["df"]
-    st.dataframe(filtered_df)
+        text = st.session_state["pdf_text"]
 
-    # Visualization using Plotly if sentiment analysis has been performed
-    if "Sentiment" in st.session_state["df"].columns:
-        st.subheader(f"📊 Sentiment Breakdown for {product}")
-        
-        # Create Plotly bar chart for sentiment distribution using filtered data
-        sentiment_counts = filtered_df["Sentiment"].value_counts().reset_index()
-        sentiment_counts.columns = ['Sentiment', 'Count']
+        if len(text) > 12000:
+            summary = summarize_large_pdf(text, style=style)
+        else:
+            with st.spinner("Summarizing..."):
+                summary = summarize_with_openai(text, style=style)
 
-        # Define custom order and colors
-        sentiment_order = ['Negative', 'Neutral', 'Positive']
-        sentiment_colors = {'Negative': 'red', 'Neutral': 'lightgray', 'Positive': 'green'}
-        
-        # Only include sentiment categories that actually exist in the data
-        existing_sentiments = sentiment_counts['Sentiment'].unique()
-        filtered_order = [s for s in sentiment_order if s in existing_sentiments]
-        filtered_colors = {s: sentiment_colors[s] for s in existing_sentiments if s in sentiment_colors}
-        
-        # Reorder the data according to our custom order (only for existing sentiments)
-        sentiment_counts['Sentiment'] = pd.Categorical(sentiment_counts['Sentiment'], categories=filtered_order, ordered=True)
-        sentiment_counts = sentiment_counts.sort_values('Sentiment')
-        
-        fig = px.bar(
-            sentiment_counts,
-            x="Sentiment",
-            y="Count",
-            title=f"Distribution of Sentiment Classifications - {product}",
-            labels={"Sentiment": "Sentiment Category", "Count": "Number of Reviews"},
-            color="Sentiment",
-            color_discrete_map=filtered_colors
-        )
-        fig.update_layout(
-            xaxis_title="Sentiment Category",
-            yaxis_title="Number of Reviews",
-            showlegend=False
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        st.session_state["summary"] = summary
 
+if "summary" in st.session_state:
+    st.subheader("✅ Summary")
+    st.write(st.session_state["summary"])
+
+    st.download_button(
+        "⬇️ Download Summary",
+        data=st.session_state["summary"].encode("utf-8"),
+        file_name="pdf_summary.txt",
+        mime="text/plain"
+    )
