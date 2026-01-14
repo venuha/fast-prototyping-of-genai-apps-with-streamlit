@@ -6,3 +6,6 @@ altair
 matplotlib
 python-dotenv
 openai
+PyPDF2        # Extract text from PDFs
+python-docx  # Extract text from Word (.docx) files
+
